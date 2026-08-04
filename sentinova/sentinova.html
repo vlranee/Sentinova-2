@@ -430,10 +430,8 @@ async function doAnalyze() {
     showResult(text, label, data.confidence, []);
     addToSession(text, label, data.confidence);
   } catch {
-    const r = localAnalyze(text);
-    showResult(text, r.label, r.confidence, r.keywords);
-    addToSession(text, r.label, r.confidence);
-    showToast('Mode offline: analisis lokal digunakan.');
+   showToast('Gagal menghubungi server prediksi. Coba lagi.');
+   document.getElementById('result-placeholder').style.display = 'block';
   } finally {
     btn.disabled = false;
     btn.textContent = 'Analisis Sekarang';
@@ -648,7 +646,10 @@ function handleCSV(file) {
         const res = await fetch((window.FLASK_API_URL||'http://localhost:5000')+'/predict', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({text}) });
         if (!res.ok) throw new Error();
         const d = await res.json(); label = d.prediction==='FRAUD'?'FRAUD':'NON_FRAUD'; confidence = d.confidence;
-      } catch { const r=localAnalyze(text); label=r.label; confidence=r.confidence; }
+      } catch { 
+       showToast('Gagal menghubungi server prediksi untuk salah satu baris CSV.'); 
+       continue; 
+      }
       batchData.push({text,label});
       addToSession(text,label,confidence);
       const isFraud = label==='FRAUD';
