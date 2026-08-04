@@ -410,7 +410,9 @@ function switchTab(name) {
   if (name === 'visualisasi') renderVisual();
 }
 
-async function doAnalyze() {
+let __pendingSingle = null; // { reqId, text }
+
+function doAnalyze() {
   const text = document.getElementById('text-input').value.trim();
   if (!text) { showToast('Masukkan teks terlebih dahulu.'); return; }
   const btn = document.getElementById('btn-analyze');
@@ -418,24 +420,41 @@ async function doAnalyze() {
   btn.innerHTML = '<span class="loading-dots"><span></span><span></span><span></span></span>';
   document.getElementById('result-placeholder').style.display = 'none';
   document.getElementById('verdict-block').classList.remove('show');
-  const API_URL = window.FLASK_API_URL || 'http://localhost:5000';
-  try {
-    const response = await fetch(API_URL + '/predict', {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ text })
-    });
-    if (!response.ok) throw new Error('API error');
-    const data = await response.json();
-    const label = data.prediction === 'FRAUD' ? 'FRAUD' : 'NON_FRAUD';
-    showResult(text, label, data.confidence, []);
-    addToSession(text, label, data.confidence);
-  } catch {
-   showToast('Gagal menghubungi server prediksi. Coba lagi.');
-   document.getElementById('result-placeholder').style.display = 'block';
-  } finally {
-    btn.disabled = false;
-    btn.textContent = 'Analisis Sekarang';
+
+  const reqId = 'single-' + Date.now() + '-' + Math.random().toString(36).slice(2);
+  __pendingSingle = { reqId, text };
+
+  // Kirim langsung ke Python lewat Streamlit component bridge (tanpa HTTP).
+  SentinovaBridge.setComponentValue({ action: 'predict', requestId: reqId, text: text });
+
+  // Jaga-jaga kalau Python tidak pernah membalas (mis. model gagal load total).
+  window.__singleTimeout = setTimeout(() => {
+    if (__pendingSingle && __pendingSingle.reqId === reqId) {
+      showToast('Gagal memproses prediksi. Coba lagi.');
+      document.getElementById('result-placeholder').style.display = 'block';
+      __pendingSingle = null;
+      btn.disabled = false;
+      btn.textContent = 'Analisis Sekarang';
+    }
+  }, 20000);
+}
+
+function handleSingleResult(result) {
+  clearTimeout(window.__singleTimeout);
+  const btn = document.getElementById('btn-analyze');
+  if (!__pendingSingle || result.requestId !== __pendingSingle.reqId) return;
+  const text = __pendingSingle.text;
+  if (result.error) {
+    showToast('Gagal memproses prediksi. Coba lagi.');
+    document.getElementById('result-placeholder').style.display = 'block';
+  } else {
+    const label = result.prediction === 'FRAUD' ? 'FRAUD' : 'NON_FRAUD';
+    showResult(text, label, result.confidence, []);
+    addToSession(text, label, result.confidence);
   }
+  __pendingSingle = null;
+  btn.disabled = false;
+  btn.textContent = 'Analisis Sekarang';
 }
 
 function localAnalyze(text) {
@@ -626,39 +645,60 @@ function renderVisual() {
 }
 
 let batchData = [];
+let __pendingBatch = null; // { reqId }
+
 function handleDrop(e) { e.preventDefault(); document.getElementById('drop-zone').classList.remove('drag-over'); if (e.dataTransfer.files[0]) handleCSV(e.dataTransfer.files[0]); }
 function handleCSV(file) {
   if (!file) return;
   const reader = new FileReader();
-  reader.onload = async (e) => {
+  reader.onload = (e) => {
     const lines = e.target.result.trim().split('\n');
     const rows = lines.map(l => l.split(',')[0].replace(/"/g,'').trim()).filter(Boolean);
     const header = rows[0].toLowerCase();
     const texts = (header === 'text') ? rows.slice(1) : rows;
+
     batchData = [];
-    const tbody = document.getElementById('batch-tbody');
-    tbody.innerHTML = '';
+    document.getElementById('batch-tbody').innerHTML = '';
     document.getElementById('batch-results').style.display = 'block';
     document.getElementById('batch-summary').textContent = 'Menganalisis ' + texts.length + ' teks...';
-    for (let i = 0; i < texts.length; i++) {
-      const text = texts[i]; let label, confidence;
-      try {
-        const res = await fetch((window.FLASK_API_URL||'http://localhost:5000')+'/predict', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({text}) });
-        if (!res.ok) throw new Error();
-        const d = await res.json(); label = d.prediction==='FRAUD'?'FRAUD':'NON_FRAUD'; confidence = d.confidence;
-      } catch { 
-       showToast('Gagal menghubungi server prediksi untuk salah satu baris CSV.'); 
-       continue; 
+
+    const reqId = 'batch-' + Date.now() + '-' + Math.random().toString(36).slice(2);
+    __pendingBatch = { reqId, texts };
+
+    // Satu round-trip ke Python untuk seluruh CSV, bukan satu request per baris.
+    SentinovaBridge.setComponentValue({ action: 'predict_batch', requestId: reqId, texts: texts });
+
+    window.__batchTimeout = setTimeout(() => {
+      if (__pendingBatch && __pendingBatch.reqId === reqId) {
+        showToast('Gagal memproses batch. Coba lagi.');
+        __pendingBatch = null;
       }
-      batchData.push({text,label});
-      addToSession(text,label,confidence);
-      const isFraud = label==='FRAUD';
-      tbody.innerHTML += '<tr><td>'+(i+1)+'</td><td title="'+escapeHtml(text)+'">'+escapeHtml(text.slice(0,60))+(text.length>60?'…':'')+'</td><td class="'+(isFraud?'badge-fraud':'badge-nonfraud')+'">'+(isFraud ? 'TERINDIKASI PENIPUAN' : 'AMAN')+'</td></tr>';
-    }
-    const fraudCount = batchData.filter(r=>r.label==='FRAUD').length;
-    document.getElementById('batch-summary').textContent = texts.length+' teks dianalisis — '+fraudCount+' Terindikasi Penipuan, '+(texts.length-fraudCount)+' Aman';
+    }, 60000);
   };
   reader.readAsText(file);
+}
+
+function handleBatchResult(batchResult) {
+  clearTimeout(window.__batchTimeout);
+  if (!__pendingBatch || batchResult.requestId !== __pendingBatch.reqId) return;
+  const results = batchResult.results || [];
+  const tbody = document.getElementById('batch-tbody');
+  tbody.innerHTML = '';
+  batchData = [];
+  results.forEach((r, i) => {
+    if (r.error) {
+      showToast('Gagal memproses salah satu baris CSV.');
+      return;
+    }
+    const label = r.prediction === 'FRAUD' ? 'FRAUD' : 'NON_FRAUD';
+    batchData.push({ text: r.text, label });
+    addToSession(r.text, label, r.confidence);
+    const isFraud = label === 'FRAUD';
+    tbody.innerHTML += '<tr><td>'+(i+1)+'</td><td title="'+escapeHtml(r.text)+'">'+escapeHtml(r.text.slice(0,60))+(r.text.length>60?'…':'')+'</td><td class="'+(isFraud?'badge-fraud':'badge-nonfraud')+'">'+(isFraud ? 'TERINDIKASI PENIPUAN' : 'AMAN')+'</td></tr>';
+  });
+  const fraudCount = batchData.filter(r=>r.label==='FRAUD').length;
+  document.getElementById('batch-summary').textContent = results.length+' teks dianalisis — '+fraudCount+' Terindikasi Penipuan, '+(results.length-fraudCount)+' Aman';
+  __pendingBatch = null;
 }
 function downloadBatchCSV() {
   if (!batchData.length) return;
@@ -672,10 +712,45 @@ function escapeRe(str) { return str.replace(/[.*+?^${}()|[\]\\]/g,'\\$&'); }
 function showToast(msg) { const t=document.getElementById('toast'); t.textContent=msg; t.classList.add('show'); setTimeout(()=>t.classList.remove('show'),2500); }
 </script>
 <script>
-  (function() {
-    const params = new URLSearchParams(window.location.search);
-    window.FLASK_API_URL = params.get('api_url') || 'http://localhost:5000';
-  })();
+/* ────────────────────────────────────────────────────────────────────────
+ * Streamlit Custom Component bridge — pengganti fetch()/HTTP.
+ * Implementasi manual protokol postMessage Streamlit (tidak perlu build
+ * step / library eksternal), supaya tidak tergantung fitur ASGI/Starlette
+ * yang masih experimental. Referensi protokol:
+ * https://docs.streamlit.io/develop/concepts/custom-components/create
+ * ──────────────────────────────────────────────────────────────────────── */
+const SentinovaBridge = (function () {
+  function send(type, data) {
+    window.parent.postMessage(Object.assign({ isStreamlitMessage: true, type }, data), '*');
+  }
+  function setComponentValue(value) {
+    send('streamlit:setComponentValue', { value, dataType: 'json' });
+  }
+  function setFrameHeight(height) {
+    send('streamlit:setFrameHeight', { height });
+  }
+  function ready() {
+    send('streamlit:componentReady', { apiVersion: 1 });
+  }
+  function onRender(event) {
+    const msg = event.data;
+    if (!msg || msg.type !== 'streamlit:render') return;
+    const args = (msg.args) || {};
+    if (args.result) handleSingleResult(args.result);
+    if (args.batch_result) handleBatchResult(args.batch_result);
+  }
+  window.addEventListener('message', onRender);
+  return { setComponentValue, setFrameHeight, ready };
+})();
+
+// Tinggi iframe di-fix mengikuti tinggi aslinya (dulu: components.html(height=920, scrolling=True)).
+// Konten yang lebih tinggi dari ini akan scroll di dalam wrapper, bukan di level iframe.
+document.documentElement.style.height = '920px';
+document.body.style.height = '920px';
+document.body.style.overflowY = 'auto';
+document.body.style.margin = '0';
+SentinovaBridge.setFrameHeight(920);
+SentinovaBridge.ready();
 </script>
 <script>lucide.createIcons();</script>
 </body>
